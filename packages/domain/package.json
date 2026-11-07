@@ -1,0 +1,11 @@
+{
+  "name": "@aitu/domain",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Pure academic domain: metrics, Risk Engine v1, course health view. No Firebase, no UI.",
+  "exports": { ".": "./src/index.ts" },
+  "scripts": {
+    "test": "tsx --test test/risk.test.ts test/courseHealth.test.ts test/grading.test.ts test/access.test.ts"
+  }
+}
