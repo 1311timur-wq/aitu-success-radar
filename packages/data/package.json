@@ -1,0 +1,14 @@
+{
+  "name": "@aitu/data",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Typed Firestore access for both apps: paths, converters, teacher commands, student subscriptions.",
+  "exports": { ".": "./src/index.ts" },
+  "dependencies": {
+    "@aitu/domain": "*"
+  },
+  "peerDependencies": {
+    "firebase": "^11.9.0"
+  }
+}
