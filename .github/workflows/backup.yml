@@ -1,0 +1,44 @@
+# Nightly Firestore backup (optional). Works on the free Spark plan: it uses the Admin SDK, not managed exports.
+# Setup (GitHub → Settings → Secrets and variables → Actions):
+#   FIREBASE_SERVICE_ACCOUNT  = full JSON of the service-account key
+#   FIREBASE_PROJECT_ID, FIREBASE_API_KEY
+# The backup is stored as a private workflow artifact for 30 days (keep the repository PRIVATE: personal data).
+name: Nightly backup
+
+on:
+  schedule:
+    - cron: '0 21 * * *'   # 02:00 Asia/Almaty
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --no-audit --no-fund
+      - name: Service-account key (from secret, never committed)
+        env:
+          SA: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          if [ -z "$SA" ]; then echo "Secret FIREBASE_SERVICE_ACCOUNT is not set — skipping."; exit 1; fi
+          printf '%s' "$SA" > "$RUNNER_TEMP/sa.json"
+      - name: Backup
+        env:
+          FIREBASE_PROJECT_ID: ${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_API_KEY: ${{ secrets.FIREBASE_API_KEY }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/sa.json
+        run: npm run backup -- --out backups/firestore-backup.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firestore-backup-${{ github.run_number }}
+          path: backups/firestore-backup.json
+          retention-days: 30
+      - name: Remove key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/sa.json"

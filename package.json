@@ -1,0 +1,49 @@
+{
+  "name": "aitu-success-radar",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "AITU Student Success Radar: Teacher Portal (LMS simulator) + My DU Radar on one Firebase backend",
+  "engines": {
+    "node": ">=20.19 <25"
+  },
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "emulators": "firebase emulators:start --project demo-aitu-radar --only auth,firestore",
+    "seed": "tsx scripts/seed.ts",
+    "verify:seed": "tsx scripts/verify-seed.ts",
+    "check:student": "tsx scripts/check-student.ts",
+    "dev:teacher": "npm --workspace @aitu/teacher run dev",
+    "build:teacher": "npm --workspace @aitu/teacher run build",
+    "test": "npm run test:domain && npm run verify:seed",
+    "test:domain": "npm --workspace @aitu/domain test",
+    "test:rules": "firebase emulators:exec --project demo-aitu-radar --only firestore \"vitest run\"",
+    "typecheck": "tsc -p tsconfig.json && npm --workspace @aitu/teacher run typecheck && npm --workspace @aitu/student run typecheck",
+    "deploy": "tsx scripts/deploy.ts",
+    "dev:student": "npm --workspace @aitu/student run dev",
+    "build:student": "npm --workspace @aitu/student run build",
+    "build": "npm run build:teacher && npm run build:student",
+    "media": "node scripts/optimize-media.mjs",
+    "demo:offline": "npm run build -w @aitu/teacher -- --mode offline && npm run build -w @aitu/student -- --mode offline && npm run preview -w @aitu/teacher",
+    "make-admin": "tsx scripts/make-admin.ts",
+    "backup": "tsx scripts/backup.ts",
+    "restore": "tsx scripts/restore.ts",
+    "iot:simulate": "tsx scripts/iot-simulate.ts",
+    "analysis": "node --no-warnings --import tsx scripts/analysis.ts"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^4.0.1",
+    "@types/node": "^22.15.0",
+    "async": "^3.2.6",
+    "firebase": "^11.9.0",
+    "firebase-admin": "^13.4.0",
+    "firebase-tools": "^14.9.0",
+    "sharp": "^0.34.4",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.0"
+  }
+}

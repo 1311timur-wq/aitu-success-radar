@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.emulator-data/
+*.log
+.env
+.env.local
+service-account*.json
+firebase-debug.log
+firestore-debug.log
+ui-debug.log
+.DS_Store
+
+# Backups contain personal data — never commit them
+backups/
+*.backup.json
