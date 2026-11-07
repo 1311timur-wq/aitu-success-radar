@@ -1,0 +1,45 @@
+/* Design tokens — Teacher Portal (desktop-first, LMS density).
+   Brand blue is the My DU accent (#006fff) darkened to pass WCAG AA for text on white. */
+:root {
+  --font: 'Golos Text', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+
+  --ink: #172033;
+  --ink-2: #3e4a5e;
+  --muted: #5d6879;
+  --canvas: #f3f5f8;
+  --paper: #ffffff;
+  --line: #dfe4ec;
+  --line-strong: #c5cdd9;
+
+  --brand: #0b57d0;
+  --brand-ink: #083f98;
+  --brand-wash: #e8f0fe;
+  --publish: #0e6b4e;
+  --publish-ink: #0a5039;
+
+  /* attendance & risk semantics: always paired with a letter or a word */
+  --present: #17784a; --present-bg: #e2f3e9;
+  --late: #8f5b00;    --late-bg: #fcefd2;
+  --excused: #4447b8; --excused-bg: #e9e9fb;
+  --absent: #b42318;  --absent-bg: #fde7e4;
+  --unmarked: #667085; --unmarked-bg: #eef1f5;
+  --warn: #8f5b00; --warn-bg: #fff6e0;
+  --danger: #b42318;
+
+  --radius-s: 6px;
+  --radius-m: 10px;
+  --radius-l: 14px;
+  --shadow-bar: 0 -6px 18px rgba(23, 32, 51, 0.08);
+  --shadow-pop: 0 18px 48px rgba(23, 32, 51, 0.22);
+  --focus: 0 0 0 3px rgba(11, 87, 208, 0.35);
+
+  --fs-xs: 12px;
+  --fs-s: 13px;
+  --fs-m: 14px;
+  --fs-l: 16px;
+  --fs-xl: 20px;
+  --fs-xxl: 28px;
+
+  --navbar-h: 56px;
+  --index-w: 248px;
+}
