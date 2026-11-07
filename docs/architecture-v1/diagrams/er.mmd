@@ -1,0 +1,15 @@
+erDiagram
+  TERM ||--o{ OFFERING : contains
+  COURSE_CATALOG ||--o{ OFFERING : offered_as
+  OFFERING ||--o{ ENROLLMENT : has
+  USER ||--o{ ENROLLMENT : enrolled
+  OFFERING ||--o{ STAFF_ASSIGNMENT : assigned
+  USER ||--o{ STAFF_ASSIGNMENT : teaches
+  OFFERING ||--o{ SESSION : schedules
+  SESSION ||--o{ ATTENDANCE_RECORD : receives
+  USER ||--o{ ATTENDANCE_RECORD : subject
+  OFFERING ||--o{ ASSESSMENT : defines
+  ASSESSMENT ||--o{ GRADE_RECORD : receives
+  USER ||--o{ GRADE_RECORD : subject
+  USER ||--o{ COURSE_SUMMARY : owns
+  OFFERING ||--o{ COURSE_SUMMARY : summarized

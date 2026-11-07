@@ -1,0 +1,11 @@
+flowchart LR
+  T[Teacher Portal: desktop] -->|onCall| F[Cloud Functions API]
+  F --> G{Identity + role + offering membership}
+  G --> C[(Canonical Firestore)]
+  C --> W[Dirty marker / recalculation]
+  W --> R[Risk Engine v1]
+  R --> P[(Student projections)]
+  S[My DU Radar: mobile] -->|Read only own docs| P
+  A[Firebase Authentication] -.-> T
+  A -.-> S
+  M[Moodle Adapter: future only] -.-> F

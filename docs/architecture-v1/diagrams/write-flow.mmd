@@ -1,0 +1,20 @@
+sequenceDiagram
+  actor Teacher
+  participant Web as Teacher Portal
+  participant API as Callable Function
+  participant DB as Firestore Canonical
+  participant W as Recompute Worker
+  participant UI as Student My DU
+  Teacher->>Web: mark attendance / save grade draft
+  Web->>API: command + requestId + Firebase auth
+  API->>API: role, assignment, enrollment and revision guards
+  API->>DB: transaction: canonical draft + audit + receipt
+  DB-->>Web: committed draft (not yet visible to student)
+  Teacher->>Web: publish
+  Web->>API: publish command
+  API->>DB: publish barrier + dirty summary job
+  DB-->>W: eventual trigger/retry
+  W->>DB: read latest published canonical records
+  W->>W: computeRisk(policy snapshot)
+  W->>DB: update owner-only materialized views (CAS)
+  DB-->>UI: read-only owner snapshot update
