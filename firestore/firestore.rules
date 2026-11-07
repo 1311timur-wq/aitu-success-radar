@@ -1,0 +1,484 @@
+rules_version = '2';
+
+// AITU Student Success Radar — Rules-first security model (data model v2, see docs/DATA_MODEL.md).
+//
+// Trust model
+// - Identity: Firebase Auth. Roles:
+//     admin   — custom claim `admin: true`, set ONLY by `npm run make-admin` (Admin SDK). Never by a client.
+//     teacher — users/{uid}.role == 'teacher', created ONLY by an admin.
+//     student — registers HIMSELF (users/{uid}.role == 'student', checked field by field below).
+// - Authority over a course: offering.staffUids / offering.studentUids. A student can add ONLY himself, and only
+//   with a valid, active join code of that very course; a teacher can only remove students and rotate the code.
+// - Teachers write canonical records of THEIR offerings directly; every invariant that must hold is
+//   checked here (membership, enrollment, value ranges, revision +1, server time, correction reason).
+// - Students read only their OWN records and only when publication == 'published'.
+// - Access-call budget: each record write costs at most 2 document access calls (offering + parent
+//   session/assessment). Client code commits at most 9 records per batch (+1 audit) => <= 19 of 20.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function offeringPath(o) { return /databases/$(database)/documents/offerings/$(o); }
+    function offeringData(o) { return get(offeringPath(o)).data; }
+    function isStaff(o) { return signedIn() && uid() in offeringData(o).staffUids; }
+    function isMember(o) {
+      let off = offeringData(o);
+      return signedIn() && (uid() in off.staffUids || uid() in off.studentUids);
+    }
+    function isPublication(v) { return v in ['draft', 'published']; }
+    // Admin = custom claim in the ID token (no document read, cannot be self-assigned).
+    function isAdmin() { return signedIn() && request.auth.token.get('admin', false) == true; }
+    function userPath(u) { return /databases/$(database)/documents/users/$(u); }
+    function canManage(o) { return isAdmin() || isStaff(o); }
+    // Mirrors packages/domain/src/validation.ts
+    function nameOk(n) { return n is string && n.size() >= 3 && n.size() <= 80; }
+    function corporateEmail(e) {
+      return e is string && e.size() <= 120 && e.matches('^[a-z0-9._%+-]+@(astanait[.]edu[.]kz|demo[.]aitu[.]kz)$');
+    }
+    function anyEmail(e) { return e is string && e.size() <= 120 && e.matches('^[a-z0-9._%+-]+@[a-z0-9.-]+[.][a-z]{2,}$'); }
+    function programOk(p) { return p in ['se', 'cs', 'bda', 'cyber', 'mt', 'itm', 'st', 'ee', 'ts', 'dj', 'other']; }
+    function groupOk(g) { return g is string && g.matches('^[A-Z]{2,4}-[0-9]{4}$'); }
+    function studentNumberOk(n) { return n is string && n.matches('^[0-9]{5,10}$'); }
+    // Registration alone does not prove the student owns the mailbox — joining a course does: the e-mail must be
+    // verified (link from the verification letter). Demo accounts (@demo.aitu.kz, no real mailbox) may join demo courses only.
+    function trustedEmailFor(o) {
+      return request.auth.token.get('email_verified', false) == true
+        || (request.auth.token.get('email', '').matches('^[a-z0-9._%+-]+@demo[.]aitu[.]kz$') && o.matches('^demo-.*'));
+    }
+    function joinCodeOk(c) { return c is string && c.matches('^[ABCDEFGHJKMNPQRSTUVWXYZ23456789]{6}$'); }
+    // The join code exists, is active and opens exactly this course.
+    function codeOpensCourse(code, o) {
+      let jc = get(/databases/$(database)/documents/joinCodes/$(code)).data;
+      return joinCodeOk(code) && jc.offeringId == o && jc.active == true;
+    }
+    function stamped(d) { return d.updatedBy == uid() && d.updatedAt == request.time; }
+    function nextRevision(d) {
+      return request.method == 'create'
+        ? d.revision == 1
+        : d.revision == resource.data.revision + 1;
+    }
+    function optString(v, maxLen) { return v == null || (v is string && v.size() <= maxLen); }
+    function unchanged(keys) {
+      return request.method == 'create' || !request.resource.data.diff(resource.data).affectedKeys().hasAny(keys);
+    }
+    // A published value changed => mandatory correction {reason, at == now}. Otherwise correction is untouched.
+    function correctionOk(needsReason) {
+      let d = request.resource.data;
+      return needsReason
+        ? (d.correction is map
+           && d.correction.keys().hasOnly(['reason', 'at', 'previous'])
+           && d.correction.reason is string && d.correction.reason.size() >= 3 && d.correction.reason.size() <= 500
+           && d.correction.at == request.time)
+        : (request.method == 'create' ? d.correction == null : d.correction == resource.data.correction);
+    }
+    function publishedValueChanged(valueKeys) {
+      return request.method == 'update'
+        && resource.data.publication == 'published'
+        && request.resource.data.diff(resource.data).affectedKeys().hasAny(valueKeys);
+    }
+
+    // ---------- identity ----------
+    match /users/{userId} {
+      allow get: if signedIn() && (uid() == userId || isAdmin());
+      allow list: if isAdmin();
+      allow create: if signedIn() && ((uid() == userId && validSelfRegistration()) || (isAdmin() && validTeacherAccount()));
+      allow update: if signedIn() && ((uid() == userId && validSelfUpdate()) || (isAdmin() && validAdminUpdate()));
+      allow delete: if false;
+
+      // Student self-registration: role is forced to 'student', e-mail must be the signed-in one.
+      function validSelfRegistration() {
+        let d = request.resource.data;
+        let keys = ['displayName', 'email', 'role', 'program', 'groupLabel', 'studentNumber', 'source', 'createdAt', 'consentAt'];
+        return d.keys().hasOnly(keys) && d.keys().hasAll(keys)
+          && d.role == 'student' && d.source == 'self'
+          && d.email == request.auth.token.email && corporateEmail(d.email)
+          && nameOk(d.displayName) && programOk(d.program) && groupOk(d.groupLabel) && studentNumberOk(d.studentNumber)
+          && d.createdAt == request.time && d.consentAt == request.time;
+      }
+      // Teacher accounts exist only because an admin created them (temporary password, must change it).
+      function validTeacherAccount() {
+        let d = request.resource.data;
+        return d.keys().hasOnly(['displayName', 'email', 'role', 'department', 'source', 'mustChangePassword', 'createdAt', 'createdBy'])
+          && d.keys().hasAll(['displayName', 'email', 'role', 'source', 'mustChangePassword', 'createdAt', 'createdBy'])
+          && d.role == 'teacher' && d.source == 'admin' && anyEmail(d.email) && nameOk(d.displayName)
+          && optString(d.get('department', null), 120)
+          && d.mustChangePassword == true && d.createdAt == request.time && d.createdBy == uid();
+      }
+      // Own profile: role, e-mail and history are immutable.
+      function validSelfUpdate() {
+        let d = request.resource.data;
+        let changed = d.diff(resource.data).affectedKeys();
+        return (resource.data.role == 'student'
+                && changed.hasOnly(['displayName', 'program', 'groupLabel', 'studentNumber'])
+                && nameOk(d.displayName) && programOk(d.get('program', 'other')) && groupOk(d.groupLabel) && studentNumberOk(d.studentNumber))
+          || (resource.data.role == 'teacher'
+                && changed.hasOnly(['mustChangePassword', 'passwordChangedAt'])
+                && d.mustChangePassword == false && d.passwordChangedAt == request.time);
+      }
+      function validAdminUpdate() {
+        let d = request.resource.data;
+        return d.diff(resource.data).affectedKeys().hasOnly(['displayName', 'department', 'mustChangePassword'])
+          && nameOk(d.displayName) && optString(d.get('department', null), 120) && d.get('mustChangePassword', false) is bool;
+      }
+
+      // "Мой план на неделю": ticks of the student's own checklist.
+      match /planState/{docId} {
+        allow read, delete: if signedIn() && uid() == userId;
+        allow create, update: if signedIn() && uid() == userId && docId == 'current'
+          && request.resource.data.keys().hasOnly(['done', 'updatedAt'])
+          && request.resource.data.done is map && request.resource.data.done.size() <= 300
+          && request.resource.data.updatedAt == request.time;
+      }
+    }
+
+    match /terms/{termId} {
+      allow read: if signedIn();
+      allow create, update: if isAdmin()
+        && request.resource.data.keys().hasOnly(['label', 'startsAt', 'endsAt', 'status'])
+        && request.resource.data.label is string && request.resource.data.label.size() <= 40
+        && request.resource.data.status in ['active', 'archived'];
+      allow delete: if false;
+    }
+
+    match /courseCatalog/{code} {
+      allow read: if signedIn();
+      allow create, update: if isAdmin() && code.matches('^[A-Z]{2,5}[0-9]{3}$')
+        && request.resource.data.keys().hasOnly(['code', 'title'])
+        && request.resource.data.code == code
+        && request.resource.data.title is string && request.resource.data.title.size() >= 3 && request.resource.data.title.size() <= 120;
+      allow delete: if false;
+    }
+
+    // ---------- join codes: the key a student types to enter a course ----------
+    // get by exact code only (no listing → codes cannot be enumerated); preview fields let the student
+    // see WHICH course he is joining before he joins.
+    match /joinCodes/{code} {
+      allow get: if signedIn();
+      allow list: if isAdmin();
+      allow create: if joinCodeOk(code) && validJoinCode(request.resource.data) && canManage(request.resource.data.offeringId);
+      allow update: if canManage(resource.data.offeringId)
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['active', 'revokedAt', 'revokedBy'])
+        && resource.data.active == true && request.resource.data.active == false
+        && request.resource.data.revokedAt == request.time && request.resource.data.revokedBy == uid();
+      allow delete: if false;
+
+      function validJoinCode(d) {
+        let keys = ['offeringId', 'courseCode', 'title', 'groupLabel', 'termLabel', 'active', 'createdBy', 'createdAt'];
+        let off = getAfter(offeringPath(d.offeringId)).data;
+        return d.keys().hasOnly(keys) && d.keys().hasAll(keys)
+          && d.active == true && d.createdBy == uid() && d.createdAt == request.time
+          && d.courseCode == off.courseCode && d.title == off.title && d.groupLabel == off.groupLabel && d.termLabel == off.termLabel;
+      }
+    }
+
+    // ---------- admin journal & cached statistics ----------
+    match /adminLog/{eventId} {
+      allow read: if isAdmin();
+      allow create: if isAdmin()
+        && request.resource.data.keys().hasOnly(['type', 'actorUid', 'at', 'target', 'details'])
+        && request.resource.data.actorUid == uid() && request.resource.data.at == request.time
+        && request.resource.data.type in ['user.teacher.created', 'user.updated', 'user.password-reset',
+                                          'offering.created', 'offering.updated', 'offering.staff.changed',
+                                          'enrollment.added', 'enrollment.removed', 'joincode.created', 'joincode.revoked',
+                                          'backup.exported', 'csv.exported', 'stats.refreshed']
+        && request.resource.data.target is string && request.resource.data.target.size() <= 200
+        && request.resource.data.details is map;
+      allow update, delete: if false;
+    }
+
+    match /stats/{statId} {
+      allow read: if isAdmin();
+      allow create, update: if isAdmin() && statId == 'latest'
+        && request.resource.data.keys().hasOnly(['computedAt', 'computedBy', 'data'])
+        && request.resource.data.computedAt == request.time && request.resource.data.computedBy == uid()
+        && request.resource.data.data is map;
+      allow delete: if false;
+    }
+
+    // ---------- offering (aggregate root) ----------
+    match /offerings/{o} {
+      // Non-admin queries must be provably scoped: where('staffUids','array-contains',uid) or ('studentUids', ...)
+      allow read: if isAdmin() || (signedIn() && (uid() in resource.data.staffUids || uid() in resource.data.studentUids));
+      allow create: if isAdmin() && validOffering();
+      allow update: if (isAdmin() && validOffering()) || staffRotatesJoinCode(o) || staffWithdrawsStudent() || studentJoins(o);
+      allow delete: if false; // archive instead (status = 'archived')
+
+      function validOffering() {
+        let d = request.resource.data;
+        return d.keys().hasOnly(['courseCode', 'title', 'termId', 'termLabel', 'groupLabel', 'status', 'staffUids', 'studentUids',
+                                 'policy', 'policyVersion', 'joinCode', 'createdAt', 'createdBy', 'updatedAt'])
+          && d.keys().hasAll(['courseCode', 'title', 'termId', 'termLabel', 'groupLabel', 'status', 'staffUids', 'studentUids', 'policy'])
+          && d.courseCode is string && d.courseCode.matches('^[A-Z]{2,5}[0-9]{3}$')
+          && d.title is string && d.title.size() >= 3 && d.title.size() <= 120
+          && groupOk(d.groupLabel) && d.termId is string && d.termLabel is string
+          && d.status in ['active', 'archived']
+          && d.staffUids is list && d.staffUids.size() <= 10
+          && d.studentUids is list && d.studentUids.size() <= 400
+          && d.policy is map
+          && (d.get('joinCode', null) == null || joinCodeOk(d.joinCode));
+      }
+      // Teacher of the course: only rotates the join code (the new code document is written in the same batch).
+      function staffRotatesJoinCode(o) {
+        let d = request.resource.data;
+        return signedIn() && uid() in resource.data.staffUids
+          && d.diff(resource.data).affectedKeys().hasOnly(['joinCode'])
+          && joinCodeOk(d.joinCode)
+          && getAfter(/databases/$(database)/documents/joinCodes/$(d.joinCode)).data.offeringId == o;
+      }
+      // Teacher of the course: removes exactly one student (never adds).
+      function staffWithdrawsStudent() {
+        let before = resource.data.studentUids;
+        let after = request.resource.data.studentUids;
+        return signedIn() && uid() in resource.data.staffUids
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['studentUids'])
+          && after.size() == before.size() - 1 && before.hasAll(after);
+      }
+      // Student: adds exactly HIMSELF, to an active course, with a valid code recorded in his enrollment (same batch).
+      function studentJoins(o) {
+        let before = resource.data;
+        let after = request.resource.data;
+        let enr = getAfter(/databases/$(database)/documents/offerings/$(o)/enrollments/$(uid())).data;
+        return signedIn() && before.status == 'active'
+          && after.diff(before).affectedKeys().hasOnly(['studentUids'])
+          && !(uid() in before.studentUids) && !(uid() in before.staffUids)
+          && after.studentUids.size() == before.studentUids.size() + 1
+          && after.studentUids.hasAll(before.studentUids) && uid() in after.studentUids
+          && enr.studentUid == uid() && enr.status == 'active'
+          && codeOpensCourse(enr.joinCode, o);
+      }
+
+      match /enrollments/{studentUid} {
+        allow read: if isAdmin() || isStaff(o) || (signedIn() && studentUid == uid());
+        allow create, update: if (isAdmin() && validAdminEnrollment(studentUid)) || selfEnroll(o, studentUid) || staffWithdraws(o);
+        allow delete: if false;
+
+        function validAdminEnrollment(studentUid) {
+          let d = request.resource.data;
+          return d.keys().hasOnly(['studentUid', 'displayName', 'studentNumber', 'groupLabel', 'status', 'enrolledAt', 'via', 'joinCode', 'updatedAt', 'updatedBy'])
+            && d.studentUid == studentUid && nameOk(d.displayName) && d.status in ['active', 'withdrawn'];
+        }
+        // Copy of the student's own profile + the join code that let him in.
+        function selfEnroll(o, studentUid) {
+          let d = request.resource.data;
+          let me = get(userPath(uid())).data;
+          let keys = ['studentUid', 'displayName', 'studentNumber', 'groupLabel', 'status', 'enrolledAt', 'via', 'joinCode'];
+          return signedIn() && studentUid == uid()
+            && (request.method == 'create' || resource.data.status == 'withdrawn')
+            && d.keys().hasOnly(keys) && d.keys().hasAll(keys)
+            && me.role == 'student' && trustedEmailFor(o)
+            && d.studentUid == uid() && d.displayName == me.displayName
+            && d.studentNumber == me.studentNumber && d.groupLabel == me.groupLabel
+            && d.status == 'active' && d.via == 'code' && d.enrolledAt == request.time
+            && codeOpensCourse(d.joinCode, o)
+            && uid() in getAfter(offeringPath(o)).data.studentUids;
+        }
+        function staffWithdraws(o) {
+          let d = request.resource.data;
+          return request.method == 'update' && isStaff(o)
+            && d.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt', 'updatedBy'])
+            && resource.data.status == 'active' && d.status == 'withdrawn'
+            && d.updatedAt == request.time && d.updatedBy == uid();
+        }
+      }
+
+      // ----- QR check-in (IoT extension): rotating code shown on the door display -----
+      // Token is readable ONLY by staff; students prove presence by sending the code they scanned.
+      match /checkinTokens/{sessionId} {
+        allow read: if isAdmin() || isStaff(o);
+        allow create, update: if isStaff(o) && validToken(o, sessionId);
+        allow delete: if false;
+
+        function validToken(o, sessionId) {
+          let d = request.resource.data;
+          let keys = ['sessionId', 'open', 'code', 'prevCode', 'rotatedAt', 'updatedBy'];
+          return d.keys().hasOnly(keys) && d.keys().hasAll(keys)
+            && d.sessionId == sessionId && d.open is bool
+            && d.code is string && d.code.matches('^[0-9]{6}$')
+            && (d.prevCode == null || (d.prevCode is string && d.prevCode.matches('^[0-9]{6}$')))
+            && d.rotatedAt == request.time && d.updatedBy == uid()
+            && get(/databases/$(database)/documents/offerings/$(o)/sessions/$(sessionId)).data.status != 'cancelled';
+        }
+      }
+
+      // One check-in per student per session; accepted only while the scanned code is fresh (server time).
+      match /checkins/{checkinId} {
+        // get by own id works even before the document exists ("have I already checked in?")
+        allow get: if isAdmin() || isStaff(o) || (signedIn() && checkinId.matches('^[A-Za-z0-9_-]+_' + uid() + '$'));
+        allow list: if isAdmin() || isStaff(o) || (signedIn() && resource.data.studentUid == uid());
+        allow create: if validCheckin(o, checkinId);
+        allow update, delete: if false;
+
+        function validCheckin(o, checkinId) {
+          let d = request.resource.data;
+          let keys = ['offeringId', 'sessionId', 'studentUid', 'code', 'at', 'method'];
+          let tk = get(/databases/$(database)/documents/offerings/$(o)/checkinTokens/$(d.sessionId)).data;
+          return signedIn() && d.keys().hasOnly(keys) && d.keys().hasAll(keys)
+            && d.studentUid == uid() && d.offeringId == o
+            && checkinId == d.sessionId + '_' + uid()
+            && uid() in offeringData(o).studentUids
+            && d.method in ['qr', 'code'] && d.at == request.time
+            && tk.open == true
+            && (d.code == tk.code || d.code == tk.prevCode)
+            && request.time < tk.rotatedAt + duration.value(45, 's');
+        }
+      }
+
+      // ----- sessions -----
+      match /sessions/{sessionId} {
+        allow read: if isAdmin() || isMember(o);
+        allow create, update: if isStaff(o) && validSession(o);
+        allow delete: if false; // cancel instead (status = 'cancelled')
+
+        function validSession(o) {
+          let d = request.resource.data;
+          return d.keys().hasOnly(['offeringId', 'type', 'topic', 'room', 'startsAt', 'durationMinutes', 'status',
+                                   'maxPoints', 'attendancePublication', 'publishedAt', 'revision',
+                                   'createdBy', 'updatedBy', 'updatedAt'])
+            && d.keys().hasAll(['offeringId', 'type', 'startsAt', 'durationMinutes', 'status', 'maxPoints',
+                                'attendancePublication', 'revision', 'createdBy', 'updatedBy', 'updatedAt'])
+            && d.offeringId == o
+            && d.type in ['lecture', 'practice', 'lab']
+            && optString(d.get('topic', null), 200)
+            && optString(d.get('room', null), 60)
+            && d.startsAt is timestamp
+            && d.durationMinutes is int && d.durationMinutes >= 10 && d.durationMinutes <= 600
+            && d.status in ['scheduled', 'held', 'cancelled']
+            && d.maxPoints is number && d.maxPoints >= 0 && d.maxPoints <= 100
+            && isPublication(d.attendancePublication)
+            && (d.get('publishedAt', null) == null || d.publishedAt is timestamp)
+            && (request.method == 'create' ? d.createdBy == uid() && d.attendancePublication == 'draft'
+                                           : d.createdBy == resource.data.createdBy)
+            // Points scale is frozen once attendance has been published.
+            && (request.method == 'create' || resource.data.attendancePublication == 'draft'
+                || d.maxPoints == resource.data.maxPoints)
+            && nextRevision(d) && stamped(d);
+        }
+      }
+
+      // ----- attendance records: id = {sessionId}_{studentUid} -----
+      match /attendanceRecords/{recordId} {
+        allow read: if isAdmin() || isStaff(o)
+          || (signedIn() && resource.data.studentUid == uid() && resource.data.publication == 'published');
+        allow create, update: if validAttendance(o, recordId);
+        allow delete: if false;
+
+        function validAttendance(o, recordId) {
+          let d = request.resource.data;
+          let off = offeringData(o);
+          // getAfter: the same batch may switch the session to 'held' while saving the first marks.
+          let session = getAfter(/databases/$(database)/documents/offerings/$(o)/sessions/$(d.sessionId)).data;
+          let marked = d.status != 'unmarked';
+          return signedIn() && uid() in off.staffUids
+            && d.studentUid in off.studentUids
+            && d.keys().hasOnly(['offeringId', 'sessionId', 'studentUid', 'status', 'points', 'remark',
+                                 'publication', 'revision', 'updatedBy', 'updatedAt', 'correction'])
+            && d.keys().hasAll(['offeringId', 'sessionId', 'studentUid', 'status', 'points', 'remark',
+                                'publication', 'revision', 'updatedBy', 'updatedAt', 'correction'])
+            && recordId == d.sessionId + '_' + d.studentUid
+            && d.offeringId == o
+            && unchanged(['offeringId', 'sessionId', 'studentUid'])
+            && session.status == 'held'
+            && d.status in ['present', 'late', 'absent', 'excused', 'unmarked']
+            && (marked ? (d.points is number && d.points >= 0 && d.points <= session.maxPoints) : d.points == null)
+            && d.remark is string && d.remark.size() <= 500
+            && isPublication(d.publication)
+            && correctionOk(publishedValueChanged(['status', 'points']))
+            && nextRevision(d) && stamped(d);
+        }
+      }
+
+      // ----- assessments (Quiz, Midterm, Final, ...) -----
+      match /assessments/{assessmentId} {
+        allow read: if isAdmin() || isMember(o);
+        allow create, update: if isStaff(o) && validAssessment(o);
+        allow delete: if false;
+
+        function validAssessment(o) {
+          let d = request.resource.data;
+          return d.keys().hasOnly(['offeringId', 'title', 'category', 'maxPoints', 'dueAt', 'countsForOverdue', 'period', 'weight',
+                                   'gradesPublication', 'publishedAt', 'revision', 'createdBy', 'updatedBy', 'updatedAt'])
+            && d.keys().hasAll(['offeringId', 'title', 'category', 'maxPoints', 'dueAt', 'countsForOverdue',
+                                'gradesPublication', 'revision', 'createdBy', 'updatedBy', 'updatedAt'])
+            && d.offeringId == o
+            && d.title is string && d.title.size() >= 1 && d.title.size() <= 120
+            && d.category in ['quiz', 'assignment', 'lab', 'project', 'midterm', 'endterm', 'final']
+            && d.maxPoints is number && d.maxPoints > 0 && d.maxPoints <= 1000
+            && (d.dueAt == null || d.dueAt is timestamp)
+            && d.countsForOverdue is bool
+            && (!d.countsForOverdue || d.dueAt is timestamp)
+            // AITU register (weeks 1–5 / 6–10 / final) and syllabus weight inside it.
+            && (d.get('period', null) == null
+                  ? d.get('weight', null) == null
+                  : d.period in ['midterm', 'endterm', 'final'] && d.weight is number && d.weight > 0 && d.weight <= 1)
+            && isPublication(d.gradesPublication)
+            && (d.get('publishedAt', null) == null || d.publishedAt is timestamp)
+            && (request.method == 'create' ? d.createdBy == uid() && d.gradesPublication == 'draft'
+                                           : d.createdBy == resource.data.createdBy)
+            && (request.method == 'create' || resource.data.gradesPublication == 'draft'
+                || d.maxPoints == resource.data.maxPoints)
+            && nextRevision(d) && stamped(d);
+        }
+      }
+
+      // ----- assessment records: id = {assessmentId}_{studentUid} -----
+      // `submission` (was the work handed in?) and `gradeState/points` (was it graded?) are independent.
+      match /assessmentRecords/{recordId} {
+        allow read: if isAdmin() || isStaff(o)
+          || (signedIn() && resource.data.studentUid == uid() && resource.data.publication == 'published');
+        allow create, update: if validAssessmentRecord(o, recordId);
+        allow delete: if false;
+
+        function validAssessmentRecord(o, recordId) {
+          let d = request.resource.data;
+          let off = offeringData(o);
+          let asm = getAfter(/databases/$(database)/documents/offerings/$(o)/assessments/$(d.assessmentId)).data;
+          return signedIn() && uid() in off.staffUids
+            && d.studentUid in off.studentUids
+            && d.keys().hasOnly(['offeringId', 'assessmentId', 'studentUid', 'submission', 'gradeState', 'points',
+                                 'maxPoints', 'feedback', 'publication', 'revision', 'updatedBy', 'updatedAt', 'correction'])
+            && d.keys().hasAll(['offeringId', 'assessmentId', 'studentUid', 'submission', 'gradeState', 'points',
+                                'maxPoints', 'feedback', 'publication', 'revision', 'updatedBy', 'updatedAt', 'correction'])
+            && recordId == d.assessmentId + '_' + d.studentUid
+            && d.offeringId == o
+            && unchanged(['offeringId', 'assessmentId', 'studentUid'])
+            && d.submission in ['pending', 'submitted', 'late_submitted', 'missing', 'excused']
+            && d.gradeState in ['pending', 'graded', 'missing', 'excused']
+            && d.maxPoints == asm.maxPoints
+            // 0 is a real grade; "not graded yet" is null, never 0.
+            && (d.gradeState == 'graded'
+                  ? (d.points is number && d.points >= 0 && d.points <= d.maxPoints)
+                  : d.points == null)
+            && d.feedback is string && d.feedback.size() <= 1000
+            && isPublication(d.publication)
+            // pending -> graded is progress, not a correction; changing an already published grade is.
+            && correctionOk(publishedValueChanged(['gradeState', 'points']) && resource.data.gradeState == 'graded')
+            && nextRevision(d) && stamped(d);
+        }
+      }
+
+      // ----- append-only audit trail (corrections, publications) -----
+      match /audit/{eventId} {
+        allow read: if isAdmin() || isStaff(o);
+        allow create: if isStaff(o)
+          && request.resource.data.keys().hasOnly(['type', 'actorUid', 'at', 'targetPath', 'reason', 'details'])
+          && request.resource.data.actorUid == uid()
+          && request.resource.data.at == request.time
+          && request.resource.data.type in ['attendance.published', 'attendance.corrected', 'grades.published',
+                                            'grade.corrected', 'session.cancelled', 'student.withdrawn',
+                                            'joincode.rotated', 'checkin.opened', 'checkin.closed']
+          && request.resource.data.targetPath is string
+          && optString(request.resource.data.get('reason', null), 500)
+          && request.resource.data.details is map;
+        allow update, delete: if false;
+      }
+    }
+
+    // Everything else is closed.
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}
